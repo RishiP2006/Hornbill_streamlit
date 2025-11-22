@@ -16,8 +16,8 @@ from ultralytics import YOLO
 # CONFIG
 # ===========================
 
-HF_REPO_ID = "RishiPTrial/Hornbill_detector"      # <-- change if needed
-HF_WEIGHTS_FILENAME = "best.pt"                   # <-- change if needed
+HF_REPO_ID = "RishiPTrial/Hornbill_detector"     # <-- change if needed
+HF_WEIGHTS_FILENAME = "hornbill_nesthole_y11s_best-2.pt"                   # <-- change if needed
 
 HORN_BILL_CLASS_NAME = "hornbill"                 # <-- class name in your model
 HORN_BILL_CLASS_ID = 0                            # <-- class ID if needed
