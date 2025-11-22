@@ -1,39 +1,35 @@
 import os
+import io
 import tempfile
 from typing import List, Tuple
 
-import cv2
-import numpy as np
 import streamlit as st
+import numpy as np
+import pandas as pd
+from PIL import Image
+import ffmpeg
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 
 
-# =========================
-# CONFIG: MODEL PARAMETERS
-# =========================
+# ===========================
+# CONFIG
+# ===========================
 
-# Hugging Face repo where your hornbill detector lives
-HF_REPO_ID = "https://huggingface.co/RishiPTrial/Hornbill_detector"   # <-- keep / change as needed
+HF_REPO_ID = "RishiPTrial/Hornbill_detector"      # <-- change if needed
+HF_WEIGHTS_FILENAME = "best.pt"                   # <-- change if needed
 
-# The filename of your YOLO weights inside that repo
-HF_WEIGHTS_FILENAME = "hornbill_nesthole_y11s_best-2.pt"                # <-- change if your file is named differently
-
-# The expected hornbill class name or class ID in your model
-HORN_BILL_CLASS_NAME = "hornbill"              # <-- change if your class label is different
-HORN_BILL_CLASS_ID = 0                         # <-- set to None if you want to rely only on name
+HORN_BILL_CLASS_NAME = "hornbill"                 # <-- class name in your model
+HORN_BILL_CLASS_ID = 0                            # <-- class ID if needed
 
 
-# =========================
-# HELPER FUNCTIONS
-# =========================
+# ===========================
+# UTILITIES
+# ===========================
 
 @st.cache_resource(show_spinner=True)
 def load_model():
-    """
-    Downloads the YOLO weights from Hugging Face (if needed) and loads the model.
-    If the repo is private, set HF_TOKEN as an environment variable in Streamlit Cloud.
-    """
+    """Download YOLO weights from HF and load model."""
     token = os.getenv("HF_TOKEN", None)
 
     weight_path = hf_hub_download(
@@ -46,17 +42,10 @@ def load_model():
     return model
 
 
-def detect_hornbill_in_frame(
-    frame: np.ndarray,
-    model: YOLO,
-    conf_threshold: float = 0.25,
-) -> bool:
-    """
-    Runs the model on a single frame and returns True if hornbill is detected.
-    """
+def detect_hornbill_in_frame(frame: np.ndarray, model: YOLO, conf_threshold=0.25):
+    """True if hornbill exists in the frame."""
     results = model(frame, verbose=False)[0]
-
-    names = results.names  # dict: class_id -> class_name
+    names = results.names
 
     for box in results.boxes:
         cls_id = int(box.cls[0])
@@ -67,228 +56,175 @@ def detect_hornbill_in_frame(
 
         class_name = names.get(cls_id, "")
 
-        # Check by class name (preferred) or by class id fallback
-        name_match = (
-            HORN_BILL_CLASS_NAME is not None
-            and class_name.lower() == HORN_BILL_CLASS_NAME.lower()
-        )
-        id_match = HORN_BILL_CLASS_ID is not None and cls_id == HORN_BILL_CLASS_ID
-
-        if name_match or id_match:
+        if class_name.lower() == HORN_BILL_CLASS_NAME.lower():
+            return True
+        if cls_id == HORN_BILL_CLASS_ID:
             return True
 
     return False
 
 
-def merge_times_to_segments(times: List[float], gap_tolerance: float) -> List[Tuple[float, float]]:
+def extract_frames(video_path, fps=2):
     """
-    Given a sorted list of timestamps (seconds) where hornbill is present,
-    merges them into continuous segments. A break > gap_tolerance creates a new segment.
+    Extract frames via ffmpeg at fixed FPS.
+    Returns: ([(timestamp(sec), frame_array)], video_duration_sec)
     """
+    # Get video metadata
+    probe = ffmpeg.probe(video_path)
+    video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+    duration = float(video_stream["duration"])
+
+    # Run ffmpeg to output PNG frames as a byte stream
+    out, _ = (
+        ffmpeg
+        .input(video_path)
+        .filter('fps', fps=fps)
+        .output('pipe:', format='image2pipe', vcodec='png')
+        .run(capture_stdout=True, capture_stderr=True)
+    )
+
+    frames = []
+    pointer = 0
+    index = 0
+
+    while pointer < len(out):
+        try:
+            # Read one PNG frame from remaining bytes
+            byte_stream = io.BytesIO(out[pointer:])
+            img = Image.open(byte_stream)
+            arr = np.array(img)
+
+            timestamp = index / fps
+            frames.append((timestamp, arr))
+
+            # Advance pointer by the size of this PNG file in bytes
+            img_bytes = byte_stream.getbuffer().nbytes
+            pointer += img_bytes
+            index += 1
+
+        except Exception:
+            break
+
+    return frames, duration
+
+
+def merge_times_to_segments(times: List[float], gap=1.0):
+    """Merge close timestamps into continuous intervals."""
     if not times:
         return []
 
+    times.sort()
     segments = []
-    seg_start = times[0]
+    start = times[0]
     prev = times[0]
 
     for t in times[1:]:
-        if t - prev <= gap_tolerance:
-            # same segment
+        if t - prev <= gap:
             prev = t
         else:
-            # close previous segment
-            segments.append((seg_start, prev))
-            seg_start = t
+            segments.append((start, prev))
+            start = t
             prev = t
 
-    segments.append((seg_start, prev))
+    segments.append((start, prev))
     return segments
 
 
-def format_time(seconds: float) -> str:
-    """
-    Format seconds as H:MM:SS.mmm (milliseconds optional).
-    """
-    if seconds < 0:
-        seconds = 0.0
-
+def format_time(seconds: float):
+    """Convert seconds → mm:ss.mmm"""
     ms = int((seconds - int(seconds)) * 1000)
-    total_seconds = int(seconds)
-    h = total_seconds // 3600
-    m = (total_seconds % 3600) // 60
-    s = total_seconds % 60
-
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}.{ms:03d}"
-    else:
-        return f"{m:02d}:{s:02d}.{ms:03d}"
+    total = int(seconds)
+    m = total // 60
+    s = total % 60
+    return f"{m:02d}:{s:02d}.{ms:03d}"
 
 
-# =========================
-# STREAMLIT APP
-# =========================
+# ===========================
+# STREAMLIT UI
+# ===========================
 
-st.set_page_config(
-    page_title="Hornbill Presence Detector",
-    page_icon="🦜",
-    layout="centered",
-)
+st.set_page_config(page_title="Hornbill Detector", page_icon="🦜")
 
-st.title("🦜 Hornbill Presence in Video")
+st.title("🦜 Hornbill Presence Detector")
 st.write(
-    """
-Upload a video, and this app will:
-
-1. Run your hornbill detection model on each frame  
-2. Find **when** the hornbill appears  
-3. Report:
-   - Time intervals where hornbill is present  
-   - Total duration (in minutes & seconds) the hornbill is in the frame
-"""
+    "Upload a video to detect when hornbill appears, the time intervals, "
+    "and the total duration it stays in frame."
 )
+
+uploaded = st.file_uploader("Upload video", type=["mp4", "mov", "mkv", "avi"])
 
 with st.sidebar:
     st.header("Settings")
-    conf_threshold = st.slider(
-        "Detection confidence threshold",
-        min_value=0.1,
-        max_value=0.9,
-        value=0.25,
-        step=0.05,
-        help="Only detections above this confidence are counted.",
-    )
-    gap_tolerance = st.slider(
-        "Gap tolerance between detections (seconds)",
-        min_value=0.0,
-        max_value=5.0,
-        value=1.0,
-        step=0.5,
-        help="Small gaps shorter than this are merged into one continuous presence.",
-    )
+    conf = st.slider("Confidence Threshold", 0.1, 0.9, 0.25, 0.05)
+    fps_extract = st.slider("FPS Sampling Rate", 1, 4, 2)
+    gap = st.slider("Gap tolerance (seconds)", 0.0, 5.0, 1.0, 0.5)
 
+if uploaded:
+    st.video(uploaded)
 
-uploaded_video = st.file_uploader(
-    "Upload a video file",
-    type=["mp4", "mov", "avi", "mkv"],
-)
+    if st.button("Analyze Video", type="primary"):
+        # Save to temp file
+        suffix = os.path.splitext(uploaded.name)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded.read())
+            video_path = tmp.name
 
-if uploaded_video is not None:
-    st.video(uploaded_video)
-
-    if st.button("Analyze video for hornbill presence", type="primary"):
-        # Save the uploaded file to a temporary location
-        suffix = os.path.splitext(uploaded_video.name)[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-            tmp_file.write(uploaded_video.read())
-            tmp_video_path = tmp_file.name
-
-        st.info("Loading model… (first time may take a bit)")
+        st.info("Loading model...")
         model = load_model()
 
-        st.info("Reading video and running detection…")
+        st.info("Extracting frames (ffmpeg)...")
+        frames, duration = extract_frames(video_path, fps=fps_extract)
 
-        cap = cv2.VideoCapture(tmp_video_path)
-        if not cap.isOpened():
-            st.error("Could not open the video. Please try another file.")
+        st.info(f"Running hornbill detection on {len(frames)} frames...")
+
+        hornbill_times = []
+        progress = st.progress(0)
+
+        for idx, (timestamp, frame) in enumerate(frames):
+            if detect_hornbill_in_frame(frame, model, conf_threshold=conf):
+                hornbill_times.append(timestamp)
+
+            progress.progress((idx + 1) / len(frames))
+
+        if not hornbill_times:
+            st.warning("No hornbill found.")
         else:
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration_secs = frame_count / fps if fps > 0 else None
+            segments = merge_times_to_segments(hornbill_times, gap)
+            total_secs = sum((end - start) for start, end in segments)
+            total_minutes = total_secs / 60
 
-            if fps <= 0:
-                st.error("Could not read FPS from video; timing may not be accurate.")
-                fps = 1.0  # fallback to avoid division by zero
+            st.success("Hornbill detected!")
+            st.metric("Total Presence (minutes)", f"{total_minutes:.2f} min")
 
-            progress_text = "Analyzing frames…"
-            progress_bar = st.progress(0)
-            status_placeholder = st.empty()
+            # Show intervals
+            st.write("### Presence Intervals")
+            rows = [{
+                "Segment": i + 1,
+                "Start (sec)": round(start, 3),
+                "End (sec)": round(end, 3),
+                "Start (time)": format_time(start),
+                "End (time)": format_time(end),
+                "Duration (sec)": round(end - start, 3),
+                "Duration": format_time(end - start),
+            } for i, (start, end) in enumerate(segments)]
 
-            hornbill_times = []  # timestamps (seconds) where hornbill is present
+            df = pd.DataFrame(rows)
+            st.dataframe(df)
 
-            frame_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            # Download CSV
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                csv,
+                "hornbill_intervals.csv",
+                "text/csv"
+            )
 
-                timestamp = frame_idx / fps  # seconds
-
-                # Run detection
-                hornbill_present = detect_hornbill_in_frame(
-                    frame, model, conf_threshold=conf_threshold
-                )
-
-                if hornbill_present:
-                    hornbill_times.append(timestamp)
-
-                frame_idx += 1
-
-                # Update progress
-                if frame_count > 0:
-                    progress_bar.progress(min(frame_idx / frame_count, 1.0))
-                    status_placeholder.write(
-                        f"{progress_text} Frame {frame_idx}/{frame_count} "
-                        f"({timestamp:.2f} s)"
-                    )
-
-            cap.release()
-
-            st.success("Analysis complete ✅")
-
-            # Compute presence segments
-            hornbill_times = sorted(hornbill_times)
-            segments = merge_times_to_segments(hornbill_times, gap_tolerance)
-
-            if not segments:
-                st.warning("No hornbill detected in this video.")
-            else:
-                total_presence_sec = sum(end - start for start, end in segments)
-                total_presence_min = total_presence_sec / 60.0
-
-                st.subheader("Results")
-
-                st.metric(
-                    "Total hornbill presence (minutes)",
-                    f"{total_presence_min:.2f} min",
-                    help=f"Equivalent to {total_presence_sec:.2f} seconds.",
-                )
-
-                st.write("### Time intervals where hornbill is in the frame")
-
-                rows = []
-                for i, (start, end) in enumerate(segments, start=1):
-                    duration = end - start
-                    rows.append(
-                        {
-                            "Segment #": i,
-                            "Start (s)": round(start, 3),
-                            "End (s)": round(end, 3),
-                            "Start (formatted)": format_time(start),
-                            "End (formatted)": format_time(end),
-                            "Duration (s)": round(duration, 3),
-                            "Duration (formatted)": format_time(duration),
-                        }
-                    )
-
-                import pandas as pd
-
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True)
-
-                # Allow download as CSV
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="📥 Download intervals as CSV",
-                    data=csv,
-                    file_name="hornbill_presence_intervals.csv",
-                    mime="text/csv",
-                )
-
-        # Clean up temp file
+        # cleanup
         try:
-            os.remove(tmp_video_path)
+            os.remove(video_path)
         except Exception:
             pass
+
 else:
-    st.info("Upload a video file to get started.")
+    st.info("Upload a video to begin.")
