@@ -1,6 +1,8 @@
 streamlit
-opencv-python-headless
 ultralytics
 huggingface_hub
 torch
 pandas
+ffmpeg-python
+Pillow
+numpy
